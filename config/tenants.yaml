@@ -1,0 +1,7 @@
+tenants:
+  demo:
+    industry: ecommerce
+    name: 演示租户
+  finance:
+    industry: finance
+    name: 金融演示

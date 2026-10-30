@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AgenTruss 管理端</title>
+  <link rel="stylesheet" href="/admin/static/themes.css?v=20261029-ui30" />
+  <link rel="stylesheet" href="/admin/static/app.css?v=20261029-ui30" />
+  <script>
+    (function () {
+      var id = localStorage.getItem("ag_theme") || "ember";
+      document.documentElement.setAttribute("data-theme", id);
+    })();
+  </script>
+</head>
+<body>
+  <div id="login-view">
+    <form class="login-card" id="login-form">
+      <span class="eyebrow">AGENT PLATFORM</span>
+      <h1>AgenTruss</h1>
+      <p class="lead">用真实 JWT 进入运营台。知识库、对话护栏、审批与审计都在侧栏里。</p>
+      <div class="field">
+        <label>用户名</label>
+        <input name="username" value="admin" autocomplete="username" required />
+      </div>
+      <div class="field">
+        <label>密码</label>
+        <input name="password" type="password" value="changeme" autocomplete="current-password" required />
+      </div>
+      <div class="field">
+        <label>租户</label>
+        <input name="tenant_code" value="demo" required />
+      </div>
+      <button class="btn" type="submit" style="width:100%">进入工作台</button>
+      <div class="error-text" id="login-error"></div>
+      <p class="meta" style="margin-top:12px">demo · finance · auditor</p>
+    </form>
+  </div>
+
+  <div id="shell" class="hidden">
+    <aside class="sidebar">
+      <div class="brand">
+        <strong>AgenTruss</strong>
+        <span>Studio Console</span>
+      </div>
+      <nav id="nav"></nav>
+    </aside>
+    <div class="main">
+      <header class="topbar">
+        <div style="display:flex;align-items:center;gap:4px">
+          <button type="button" class="nav-toggle" id="nav-toggle" aria-label="菜单">☰</button>
+          <div class="title">运营工作台</div>
+        </div>
+        <div>
+          <span class="meta" id="user-meta"></span>
+          <button class="btn secondary" id="logout-btn" style="margin-left:10px">退出</button>
+        </div>
+      </header>
+      <main class="content" id="content"></main>
+    </div>
+  </div>
+
+  <div id="modal-root"></div>
+  <div id="toast-host" class="toast-host" aria-live="polite"></div>
+  <script src="/admin/static/admin-kit.js?v=20261029-ui30"></script>
+  <script src="/admin/static/pages-dashboard.js?v=20261029-ui30"></script>
+  <script src="/admin/static/pages-system.js?v=20261029-ui30"></script>
+  <script src="/admin/static/pages-chat.js?v=20261029-ui30"></script>
+  <script src="/admin/static/pages-kb.js?v=20261029-ui30"></script>
+  <script src="/admin/static/pages-kb-docs.js?v=20261029-ui30"></script>
+  <script src="/admin/static/pages-kb-query.js?v=20261029-ui30"></script>
+  <script src="/admin/static/pages-agent.js?v=20261029-ui30"></script>
+  <script src="/admin/static/pages-agent-runtime.js?v=20261029-ui30"></script>
+  <script src="/admin/static/pages-tickets.js?v=20261029-ui30"></script>
+  <script src="/admin/static/pages-audit-logs.js?v=20261029-ui30"></script>
+  <script src="/admin/static/pages-executions.js?v=20261029-ui30"></script>
+  <script src="/admin/static/pages-ext-kb.js?v=20261029-ui30"></script>
+  <script src="/admin/static/pages-ext-kb-forms.js?v=20261029-ui30"></script>
+  <script src="/admin/static/pages-ext-agent.js?v=20261029-ui30"></script>
+  <script src="/admin/static/pages-ext-agent-readonly.js?v=20261029-ui30"></script>
+  <script src="/admin/static/pages-ext-audit.js?v=20261029-ui30"></script>
+  <script src="/admin/static/pages-ext-channels.js?v=20261029-ui30"></script>
+  <script src="/admin/static/pages-ext-iam.js?v=20261029-ui30"></script>
+  <script src="/admin/static/pages-ext-rbac.js?v=20261029-ui30"></script>
+  <script src="/admin/static/console-pages.js?v=20261029-ui30"></script>
+  <script src="/admin/static/app.js?v=20261029-ui30"></script>
+</body>
+</html>

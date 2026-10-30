@@ -1,0 +1,633 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: |
+          python -m pip install -U "pip" "setuptools>=84.1.0" "wheel"
+          pip install -e .
+          pip install pip-audit bandit
+      - name: Unit + API tests (memory backend)
+        env:
+          APP_ENV: test
+          STORAGE_BACKEND: memory
+          WORKFLOW_ENGINE: langgraph
+          JWT_SECRET: ci-test-secret-key-32-chars-min!!
+          ALLOW_DEMO_USERS: "true"
+          DEMO_PASSWORD: changeme
+          EMBEDDING_PROVIDER: mock
+          EMBEDDING_MODE: mock
+          VECTOR_STORE_BACKEND: mock
+          RAG_BACKEND: mock
+        run: pytest -q --tb=short --junitxml=junit-unit.xml
+      - name: Ruff + Mypy (full app)
+        run: |
+          pip install -e ".[dev]"
+          ruff check app/modules/approvals app/modules/knowledge app/tools
+          # Full-package typecheck (DeclarativeBase + targeted fixes). Third-party stubs may be missing → ignore_missing_imports.
+          mypy app
+      - name: pip-audit (fail on known vulns)
+        run: |
+          python -m pip install -U "setuptools>=84.1.0"
+          pip-audit --progress-spinner off
+      - name: Bandit (fail on High)
+        run: |
+          bandit -r app -ll -ii -f txt -o bandit-report.txt
+          if grep -E "Severity: High" bandit-report.txt; then exit 1; fi
+      - name: Secret scan (basic)
+        run: |
+          if grep -RInE 'ghp_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]+' app config tests README.md; then exit 1; fi
+      - name: Compose config lint
+        run: |
+          printf '%s\n' \
+            'DATABASE_URL=postgresql+psycopg://agent:ci-only@127.0.0.1:5432/agenttruss' \
+            'REDIS_URL=redis://127.0.0.1:6379/0' \
+            'JWT_SECRET=ci-test-secret-key-32-chars-min!!' \
+            'POSTGRES_PASSWORD=ci-only-password' \
+            'MINIO_ROOT_PASSWORD=ci-only-minio-password' > .env
+          docker compose -f docker-compose.yml config -q
+          docker compose -f docker-compose.yml config --services | tee /tmp/compose-services.txt
+          if grep -qx minio /tmp/compose-services.txt; then
+            echo "FAIL: minio should not be in default compose services"
+            exit 1
+          fi
+          if ! grep -qx migrate /tmp/compose-services.txt; then
+            echo "FAIL: migrate service missing from default compose"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-unit
+          path: junit-unit.xml
+
+  pg-integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: agent
+          POSTGRES_PASSWORD: ci-pg-password
+          POSTGRES_DB: agenttruss_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agent -d agenttruss_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: |
+          python -m pip install -U pip
+          pip install -e .
+      - name: Alembic + PG CAS (stream logs; refuse skip)
+        env:
+          APP_ENV: test
+          STORAGE_BACKEND: postgres
+          DATABASE_URL: postgresql+psycopg://agent:ci-pg-password@127.0.0.1:5432/agenttruss_test
+          JWT_SECRET: ci-test-secret-key-32-chars-min!!
+          TICKET_ARGS_SECRET: ci-test-ticket-args-secret-32!!
+          ALLOW_DEMO_USERS: "true"
+          DEMO_PASSWORD: changeme
+          RUN_PG_INTEGRATION: "1"
+          ALLOW_PG_SCHEMA_RESET: "1"
+          EMBEDDING_PROVIDER: mock
+          VECTOR_STORE_BACKEND: mock
+        run: |
+          set -o pipefail
+          set +e
+          # Migration + CAS first (may DROP SCHEMA). Stream logs; keep real exit code.
+          pytest -vv --tb=short --junitxml=junit-pg-core.xml -rs \
+            tests/test_pg_safety.py \
+            tests/test_alembic_pg_upgrade.py \
+            tests/test_approvals_pg_cas.py \
+            | tee /tmp/pg-core.txt
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "pytest_core_exit=$code"
+          cat /tmp/pg-core.txt
+          if [ "$code" -ne 0 ]; then exit "$code"; fi
+          python tests/junit_gate.py junit-pg-core.xml
+      - name: PostgresSaver round-trip (after migrate/CAS)
+        env:
+          APP_ENV: test
+          STORAGE_BACKEND: postgres
+          CHECKPOINTER_BACKEND: postgres
+          DATABASE_URL: postgresql+psycopg://agent:ci-pg-password@127.0.0.1:5432/agenttruss_test
+          JWT_SECRET: ci-test-secret-key-32-chars-min!!
+          TICKET_ARGS_SECRET: ci-test-ticket-args-secret-32!!
+          ALLOW_DEMO_USERS: "true"
+          DEMO_PASSWORD: changeme
+          RUN_PG_INTEGRATION: "1"
+          EMBEDDING_PROVIDER: mock
+          VECTOR_STORE_BACKEND: mock
+        run: |
+          set -o pipefail
+          set +e
+          pytest -vv --tb=short --junitxml=junit-pg-checkpointer.xml -rs \
+            tests/test_postgres_checkpointer.py \
+            | tee /tmp/pg-cp.txt
+          code=${PIPESTATUS[0]}
+          set -e
+          cat /tmp/pg-cp.txt
+          if [ "$code" -ne 0 ]; then exit "$code"; fi
+          python tests/junit_gate.py junit-pg-checkpointer.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-pg
+          path: |
+            junit-pg-core.xml
+            junit-pg-checkpointer.xml
+            /tmp/pg-core.txt
+            /tmp/pg-cp.txt
+
+  browser-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install + Chromium
+        run: |
+          python -m pip install -U pip
+          pip install -e ".[dev]"
+          pip install playwright
+          python -m playwright install --with-deps chromium
+      - name: Admin SPA E2E
+        env:
+          APP_ENV: test
+          STORAGE_BACKEND: memory
+          JWT_SECRET: ci-test-secret-key-32-chars-min!!
+          ALLOW_DEMO_USERS: "true"
+          DEMO_PASSWORD: changeme
+          EMBEDDING_PROVIDER: mock
+          VECTOR_STORE_BACKEND: mock
+          RUN_BROWSER_E2E: "1"
+        run: |
+          set -o pipefail
+          attempt=1
+          max_attempts=2
+          code=1
+          while [ "$attempt" -le "$max_attempts" ]; do
+            echo "=== browser-e2e attempt ${attempt}/${max_attempts} ==="
+            set +e
+            pytest -vv --tb=short --junitxml=junit-browser.xml -rs tests/test_admin_browser_e2e.py \
+              | tee /tmp/browser-pytest.txt
+            code=${PIPESTATUS[0]}
+            set -e
+            if [ "$code" -eq 0 ]; then
+              break
+            fi
+            attempt=$((attempt + 1))
+            if [ "$attempt" -le "$max_attempts" ]; then
+              echo "browser-e2e failed; retrying once for runner flakiness"
+              sleep 3
+            fi
+          done
+          cat /tmp/browser-pytest.txt
+          if [ "$code" -ne 0 ]; then exit "$code"; fi
+          python tests/junit_gate.py junit-browser.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-browser
+          path: |
+            junit-browser.xml
+            /tmp/browser-pytest.txt
+
+  compose-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Prepare .env
+        run: |
+          cat > .env <<'EOF'
+          APP_ENV=test
+          STORAGE_BACKEND=postgres
+          CHECKPOINTER_BACKEND=memory
+          DATABASE_URL=postgresql+psycopg://agent:ci-compose-pass@postgres:5432/agenttruss
+          REDIS_URL=redis://redis:6379/0
+          JWT_SECRET=ci-compose-jwt-secret-key-32chars!!
+          TICKET_ARGS_SECRET=ci-compose-ticket-args-secret-32!
+          POSTGRES_USER=agent
+          POSTGRES_PASSWORD=ci-compose-pass
+          POSTGRES_DB=agenttruss
+          ALLOW_DEMO_USERS=true
+          DEMO_PASSWORD=changeme
+          EMBEDDING_PROVIDER=mock
+          VECTOR_STORE_BACKEND=mock
+          MINIO_ROOT_PASSWORD=ci-compose-minio-password
+          EOF
+      - name: Default compose Knowledge flow + API restart recovery
+        run: |
+          set -euo pipefail
+          COMPOSE="docker compose -p agentruss_ci_smoke -f docker-compose.yml"
+          dump_logs() {
+            echo "=== compose dump ($1) ===" | tee -a /tmp/compose-smoke.log
+            $COMPOSE ps -a 2>&1 | tee -a /tmp/compose-smoke.log || true
+            $COMPOSE logs --no-color api migrate postgres redis 2>&1 | tee -a /tmp/compose-smoke.log || true
+          }
+          trap 'dump_logs trap_exit' ERR
+          wait_health() {
+            local label="$1"
+            local ready=0
+            for i in $(seq 1 60); do
+              if curl -sf http://127.0.0.1:8000/health >/dev/null; then ready=1; break; fi
+              sleep 2
+            done
+            if [ "$ready" != "1" ]; then
+              echo "FAIL: API never healthy ($label)"
+              dump_logs "unhealthy_$label"
+              exit 1
+            fi
+            curl -sf http://127.0.0.1:8000/health
+            curl -sf http://127.0.0.1:8000/ready | tee /tmp/ready.json
+            python -c "import json; d=json.load(open('/tmp/ready.json')); assert d.get('status')=='ready', d"
+          }
+          $COMPOSE config --services | tee /tmp/svc.txt
+          if grep -qx minio /tmp/svc.txt; then echo "FAIL: minio in default"; exit 1; fi
+          if grep -qx milvus /tmp/svc.txt; then echo "FAIL: milvus in default"; exit 1; fi
+          $COMPOSE build
+          $COMPOSE up -d postgres redis
+          $COMPOSE run --rm migrate
+          $COMPOSE up -d api
+          wait_health before_flow
+          TOKEN=$(curl -sf -X POST http://127.0.0.1:8000/api/auth/login \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"admin","password":"changeme","tenant_code":"demo"}' \
+            | python -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+          KB_ID=$(curl -sf -X POST http://127.0.0.1:8000/api/admin/knowledge-bases \
+            -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+            -d '{"name":"ci-kb","code":"cikb"}' \
+            | python -c "import sys,json; print(json.load(sys.stdin)['id'])")
+          python -c "print(('退货政策七天无理由。'*80)+'COMPOSE_MARK')" > /tmp/policy.md
+          DOC_ID=$(curl -sf -X POST "http://127.0.0.1:8000/api/admin/kb/${KB_ID}/documents" \
+            -H "Authorization: Bearer $TOKEN" \
+            -F "file=@/tmp/policy.md;type=text/markdown" \
+            | python -c "import sys,json; print(json.load(sys.stdin)['id'])")
+          DETAIL=$(curl -sf "http://127.0.0.1:8000/api/admin/documents/${DOC_ID}" -H "Authorization: Bearer $TOKEN")
+          echo "$DETAIL" | python -c "import sys,json; d=json.load(sys.stdin); t=d.get('text') or ''; assert 'COMPOSE_MARK' in t and len(t)>500, d"
+          curl -sf -X POST "http://127.0.0.1:8000/api/admin/documents/${DOC_ID}/parse" -H "Authorization: Bearer $TOKEN" >/dev/null
+          curl -sf -X POST "http://127.0.0.1:8000/api/admin/documents/${DOC_ID}/chunk" \
+            -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{}' >/dev/null
+          curl -sf -X POST "http://127.0.0.1:8000/api/admin/documents/${DOC_ID}/vectorize" -H "Authorization: Bearer $TOKEN" >/dev/null
+          MODE=$(curl -sf -X POST http://127.0.0.1:8000/api/admin/kb/retrieve-test \
+            -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+            -d "{\"kb_id\":\"$KB_ID\",\"query\":\"退货\"}" \
+            | python -c "import sys,json; print(json.load(sys.stdin).get('provider_mode',''))")
+          echo "provider_mode=$MODE"
+          echo "$MODE" | grep -qi mock
+          $COMPOSE restart api
+          wait_health after_restart
+          curl -sf "http://127.0.0.1:8000/api/admin/documents/${DOC_ID}" -H "Authorization: Bearer $TOKEN" \
+            | python -c "import sys,json; d=json.load(sys.stdin); t=d.get('text') or ''; assert 'COMPOSE_MARK' in t and len(t)>500, d; print('restart_body_ok', len(t))"
+          curl -sf -X DELETE "http://127.0.0.1:8000/api/admin/documents/${DOC_ID}" -H "Authorization: Bearer $TOKEN" >/dev/null
+          code=$(curl -s -o /tmp/del.json -w "%{http_code}" "http://127.0.0.1:8000/api/admin/documents/${DOC_ID}" -H "Authorization: Bearer $TOKEN" || true)
+          echo "after_delete_http=$code"
+          test "$code" = "404"
+          trap - ERR
+      - name: Upload compose smoke logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-smoke-logs
+          path: |
+            /tmp/compose-smoke.log
+            /tmp/ready.json
+            /tmp/svc.txt
+          if-no-files-found: ignore
+      - name: Cleanup
+        if: always()
+        run: docker compose -p agentruss_ci_smoke -f docker-compose.yml down -v --remove-orphans || true
+
+  minio-integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: agent
+          POSTGRES_PASSWORD: ci-pg-password
+          POSTGRES_DB: agenttruss_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U agent -d agenttruss_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      minio:
+        # bitnami/minio moved; 2024.10.2 tag is gone (manifest unknown on GHA).
+        # bitnamilegacy keeps pinned S3-compatible images pullable on Actions.
+        image: bitnamilegacy/minio:2025.7.23-debian-12-r5
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: ci-minio-password-32chars!!
+          MINIO_DEFAULT_BUCKETS: agentruss
+        ports: ["9000:9000"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Wait MinIO + ensure bucket
+        run: |
+          set -euo pipefail
+          ready=0
+          for i in $(seq 1 40); do
+            if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null; then ready=1; break; fi
+            sleep 2
+          done
+          if [ "$ready" != "1" ]; then
+            echo "FAIL: MinIO service never healthy"
+            exit 1
+          fi
+          python -m pip install -U pip
+          pip install -e ".[storage]"
+          python - <<'PY'
+          from minio import Minio
+          c = Minio("127.0.0.1:9000", access_key="minioadmin", secret_key="ci-minio-password-32chars!!", secure=False)
+          if not c.bucket_exists("agentruss"):
+              c.make_bucket("agentruss")
+          print("bucket_ok")
+          PY
+      - name: MinIO document body tests
+        env:
+          APP_ENV: test
+          STORAGE_BACKEND: postgres
+          DATABASE_URL: postgresql+psycopg://agent:ci-pg-password@127.0.0.1:5432/agenttruss_test
+          JWT_SECRET: ci-test-secret-key-32-chars-min!!
+          TICKET_ARGS_SECRET: ci-test-ticket-args-secret-32!!
+          ALLOW_DEMO_USERS: "true"
+          DEMO_PASSWORD: changeme
+          RUN_MINIO_INTEGRATION: "1"
+          ALLOW_PG_SCHEMA_RESET: "1"
+          MINIO_ENDPOINT: 127.0.0.1:9000
+          MINIO_ACCESS_KEY: minioadmin
+          MINIO_SECRET_KEY: ci-minio-password-32chars!!
+          MINIO_BUCKET: agentruss
+          EMBEDDING_PROVIDER: mock
+          VECTOR_STORE_BACKEND: mock
+        run: |
+          set -o pipefail
+          set +e
+          pytest -vv --tb=short --junitxml=junit-minio.xml -rs tests/test_minio_integration.py \
+            | tee /tmp/minio-pytest.txt
+          code=${PIPESTATUS[0]}
+          set -e
+          cat /tmp/minio-pytest.txt
+          if [ "$code" -ne 0 ]; then exit "$code"; fi
+          python tests/junit_gate.py junit-minio.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-minio
+          path: |
+            junit-minio.xml
+            /tmp/minio-pytest.txt
+
+  # Self-hosted Milvus via compose profile (no external URI/secret required).
+  # Skip ≠ pass: job always runs; junit_gate refuses empty/skip-as-pass.
+  milvus-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Prepare .env for milvus profile
+        # Compose interpolates ALL services in docker-compose.yml (even unused).
+        # Incomplete .env ⇒ immediate fail on DATABASE_URL/POSTGRES_PASSWORD/etc.
+        run: |
+          cat > .env <<'EOF'
+          APP_ENV=test
+          STORAGE_BACKEND=postgres
+          DATABASE_URL=postgresql+psycopg://agent:ci-milvus-pg@127.0.0.1:5432/agenttruss
+          REDIS_URL=redis://127.0.0.1:6379/0
+          JWT_SECRET=ci-test-secret-key-32-chars-min!!
+          POSTGRES_USER=agent
+          POSTGRES_PASSWORD=ci-milvus-pg
+          POSTGRES_DB=agenttruss
+          MINIO_ROOT_USER=minioadmin
+          MINIO_ROOT_PASSWORD=ci-milvus-minio-password-32!!
+          MINIO_BUCKET=agentruss
+          EOF
+          docker compose -f docker-compose.yml --profile milvus config -q
+      - name: Start MinIO + etcd + Milvus
+        run: |
+          set -euo pipefail
+          COMPOSE="docker compose -p agentruss_ci_milvus -f docker-compose.yml --profile milvus"
+          $COMPOSE up -d minio etcd milvus
+          ready=0
+          for i in $(seq 1 60); do
+            # gRPC :19530 is not HTTP; wait on compose healthcheck (etcd exec-form + milvus /healthz).
+            if $COMPOSE ps milvus 2>/dev/null | grep -Eiq '\(healthy\)'; then
+              ready=1
+              break
+            fi
+            sleep 5
+          done
+          $COMPOSE ps -a
+          if [ "$ready" != "1" ]; then
+            $COMPOSE logs --no-color etcd milvus minio || true
+            echo "FAIL: milvus never healthy"
+            exit 1
+          fi
+      - name: Milvus upsert/search/delete (run twice for repeatability)
+        env:
+          APP_ENV: test
+          RUN_MILVUS_INTEGRATION: "1"
+          MILVUS_URI: http://127.0.0.1:19530
+          VECTOR_STORE_BACKEND: milvus
+          RAG_BACKEND: milvus
+          EMBEDDING_DIM: "8"
+          JWT_SECRET: ci-test-secret-key-32-chars-min!!
+        run: |
+          pip install -U pip
+          pip install -e ".[storage]"
+          set -o pipefail
+          set +e
+          pytest -vv --tb=short --junitxml=junit-milvus.xml -rs tests/test_milvus_integration.py \
+            | tee /tmp/milvus.txt
+          code=${PIPESTATUS[0]}
+          set -e
+          cat /tmp/milvus.txt
+          if [ "$code" -ne 0 ]; then exit "$code"; fi
+          python tests/junit_gate.py junit-milvus.xml
+          # Second pass: unique ids per test; proves cleanup + re-run stability.
+          set +e
+          pytest -vv --tb=short --junitxml=junit-milvus-2.xml -rs tests/test_milvus_integration.py \
+            | tee /tmp/milvus-2.txt
+          code2=${PIPESTATUS[0]}
+          set -e
+          cat /tmp/milvus-2.txt
+          if [ "$code2" -ne 0 ]; then exit "$code2"; fi
+          python tests/junit_gate.py junit-milvus-2.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-milvus
+          path: |
+            junit-milvus.xml
+            junit-milvus-2.xml
+            /tmp/milvus.txt
+            /tmp/milvus-2.txt
+          if-no-files-found: ignore
+      - name: Cleanup milvus stack
+        if: always()
+        run: docker compose -p agentruss_ci_milvus -f docker-compose.yml --profile milvus down -v --remove-orphans || true
+
+  # Real third-party HTTPS (jsonplaceholder) — no API key; skip≠pass via junit_gate.
+  jsonplaceholder-tool:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install + jsonplaceholder Adapter
+        env:
+          APP_ENV: test
+          STORAGE_BACKEND: memory
+          JWT_SECRET: ci-test-secret-key-32-chars-min!!
+          ALLOW_DEMO_USERS: "true"
+          DEMO_PASSWORD: changeme
+          RUN_JSONPLACEHOLDER_TOOL: "1"
+          EMBEDDING_PROVIDER: mock
+          VECTOR_STORE_BACKEND: mock
+        run: |
+          pip install -U pip
+          pip install -e .
+          set -o pipefail
+          set +e
+          pytest -vv --tb=short --junitxml=junit-jsonplaceholder.xml -rs \
+            tests/test_jsonplaceholder_adapter.py | tee /tmp/jp.txt
+          code=${PIPESTATUS[0]}
+          set -e
+          cat /tmp/jp.txt
+          if [ "$code" -ne 0 ]; then exit "$code"; fi
+          python tests/junit_gate.py junit-jsonplaceholder.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-jsonplaceholder
+          path: |
+            junit-jsonplaceholder.xml
+            /tmp/jp.txt
+          if-no-files-found: ignore
+
+  # Redis is a production rate-limit/session dependency; default unit tests isolate
+  # Redis (conftest). This job is a release gate for the real client path.
+  redis-integration:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Redis real integration
+        env:
+          APP_ENV: test
+          STORAGE_BACKEND: memory
+          REDIS_URL: redis://127.0.0.1:6379/0
+          RUN_REDIS_INTEGRATION: "1"
+          JWT_SECRET: ci-test-secret-key-32-chars-min!!
+          ALLOW_DEMO_USERS: "true"
+          DEMO_PASSWORD: changeme
+          EMBEDDING_PROVIDER: mock
+          VECTOR_STORE_BACKEND: mock
+        run: |
+          pip install -U pip
+          pip install -e .
+          set -o pipefail
+          set +e
+          pytest -vv --tb=short --junitxml=junit-redis.xml -rs \
+            tests/test_integration_gates.py -k redis_login | tee /tmp/redis.txt
+          code=${PIPESTATUS[0]}
+          set -e
+          cat /tmp/redis.txt
+          if [ "$code" -ne 0 ]; then exit "$code"; fi
+          python tests/junit_gate.py junit-redis.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-redis
+          path: |
+            junit-redis.xml
+            /tmp/redis.txt
+          if-no-files-found: ignore
+
+  live-e2e:
+    runs-on: ubuntu-latest
+    # Requires repo Secret DASHSCOPE_API_KEY (or OPENAI_API_KEY) + var RUN_AGENTSCOPE_LIVE=true.
+    # Absence ⇒ job skipped (not counted as Live PASS).
+    if: ${{ vars.RUN_AGENTSCOPE_LIVE == 'true' }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install + Live E2E
+        env:
+          RUN_AGENTSCOPE_LIVE: "1"
+          AGENTSCOPE_MODEL_MODE: live
+          AGENTSCOPE_ENABLED: "true"
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          JWT_SECRET: ci-test-secret-key-32-chars-min!!
+          ALLOW_DEMO_USERS: "true"
+          DEMO_PASSWORD: changeme
+        run: |
+          pip install -U pip
+          pip install -e ".[agentscope]"
+          if [ -z "${DASHSCOPE_API_KEY:-}" ] && [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "FAIL: RUN_AGENTSCOPE_LIVE enabled but no DASHSCOPE_API_KEY/OPENAI_API_KEY secret"
+            exit 1
+          fi
+          set -o pipefail
+          set +e
+          pytest -vv --tb=short --junitxml=junit-live.xml -rs \
+            tests/test_integration_gates.py -k agentscope_live | tee /tmp/live.txt
+          code=${PIPESTATUS[0]}
+          set -e
+          cat /tmp/live.txt
+          if [ "$code" -ne 0 ]; then exit "$code"; fi
+          python tests/junit_gate.py junit-live.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-live
+          path: |
+            junit-live.xml
+            /tmp/live.txt
+          if-no-files-found: ignore

@@ -1,0 +1,42 @@
+# Minimal TeamPipeline demo config (AgentScope 2.0.10).
+# Used only when AGENT_RUNTIME=agentscope_team and AGENTSCOPE_ENABLED=true.
+version: "1"
+timeout_ms: 20000
+max_llm_calls: 20
+leader:
+  name: Leader
+  system_prompt: >
+    You are the team leader. Assign work with TeamAssign, then give a short
+    final answer in Chinese after members return.
+  model:
+    provider: stub
+    model: gateway-stub
+members:
+  - name: Researcher
+    description: Collects knowledge evidence and summarizes findings.
+    system_prompt: You are a researcher. Answer briefly with evidence notes.
+    tools: []
+    model:
+      provider: stub
+      model: gateway-stub
+  - name: RiskChecker
+    description: Checks business facts using platform tools when needed.
+    system_prompt: You are a risk checker. Use platform tools only when required.
+    tools:
+      - query_order
+    model:
+      provider: stub
+      model: gateway-stub
+# Stub model script (no external LLM). Placeholders: {message}
+stub_script:
+  leader_steps:
+    - assign:
+        member: Researcher
+        prompt: "整理与用户问题相关的证据：{message}"
+    - assign:
+        member: RiskChecker
+        prompt: "核查业务事实（可用平台工具）：{message}"
+    - final: "综合成员结果：问题已分析完毕。"
+  member_replies:
+    Researcher: "证据：知识片段已整理。"
+    RiskChecker: "风险核查：未发现高风险操作。"

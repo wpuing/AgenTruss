@@ -1,0 +1,16 @@
+industry: ecommerce
+topics:
+  - 订单
+  - 物流
+  - 退货
+  - 商品
+  - 运费
+confidence_threshold: 0.6
+max_message_length: 2000
+off_topic_message: 请咨询订单、物流或退货相关问题。
+risky_promises:
+  - 可以退款
+  - 马上改单
+tools:
+  - query_order
+  - refund_order

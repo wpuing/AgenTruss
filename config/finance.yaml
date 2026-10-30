@@ -1,0 +1,13 @@
+industry: finance
+topics:
+  - 理财
+  - 开户
+  - 净值
+confidence_threshold: 0.6
+max_message_length: 2000
+off_topic_message: 请咨询理财或开户相关问题。
+risky_promises:
+  - 保证收益
+tools:
+  - query_order
+  - refund_order
